@@ -25,4 +25,3 @@ clean:
 	$(MAKE) -f $(LEGACY_MAKEFILE) clean
 
 .PHONY: all cpp test cpp-test legacy-c legacy-test legacy-clean clean
-

@@ -5,4 +5,3 @@ DerivePointerAlignment: false
 PointerAlignment: Left
 AllowShortFunctionsOnASingleLine: Empty
 BreakBeforeBraces: Attach
-
