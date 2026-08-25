@@ -1,0 +1,34 @@
+CC ?= cc
+CPPFLAGS = -Isrc/counter -Isrc/storage -Isrc/metrics -Isrc/server -Isrc/routing -Isrc/control
+CFLAGS = -O3 -std=c11 -Wall -Wextra -Werror -pthread
+BUILD = build
+SERVER_SRCS = src/server/main.c src/server/connection.c src/counter/incrnchk.c src/storage/counter_store.c src/metrics/metrics.c src/routing/router.c src/control/hotkey_detector.c
+
+all: $(BUILD)/counter-server $(BUILD)/benchmark $(BUILD)/offered-benchmark $(BUILD)/lane-benchmark $(BUILD)/test-incrnchk
+
+$(BUILD):
+	mkdir -p $@
+
+$(BUILD)/counter-server: $(SERVER_SRCS) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD)/benchmark: benchmark/benchmark.c | $(BUILD)
+	$(CC) $(CFLAGS) $< -lm -o $@
+
+$(BUILD)/offered-benchmark: benchmark/offered_benchmark.c | $(BUILD)
+	$(CC) $(CFLAGS) $< -lm -o $@
+
+$(BUILD)/lane-benchmark: benchmark/lane_benchmark.c | $(BUILD)
+	$(CC) $(CFLAGS) $< -o $@
+
+$(BUILD)/test-incrnchk: tests/correctness/test_incrnchk.c src/counter/incrnchk.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+test: $(BUILD)/test-incrnchk
+	$(BUILD)/test-incrnchk
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all test clean
+

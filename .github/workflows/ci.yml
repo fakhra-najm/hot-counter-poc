@@ -1,0 +1,22 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cxx:
+    name: C++20 correctness suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test canonical C++ implementation
+        run: make -C cpp clean all test
+
+  c_harness:
+    name: Historical C harness
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: make legacy-clean legacy-c legacy-test

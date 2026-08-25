@@ -1,0 +1,26 @@
+# C and C++ build products
+/build/
+/cpp/build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Local benchmark output
+/results/*.csv
+/results/*.log
+*.profraw
+*.profdata
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Credentials and environment-specific settings
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
