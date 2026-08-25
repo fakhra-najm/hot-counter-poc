@@ -2,12 +2,13 @@
 
 A C++20 proof of concept for one question:
 
-> Can one **logical financial counter** stay correct when many requests update it
-> at the same time?
+> Can one **hot logical financial counter** scale toward millions of
+> **variable-delta operations per second** while preserving a hard limit?
 
 **Current boundary:** the small-instance experiment demonstrated roughly 70K
-completed operations/second with a hard limit. It does **not** prove a DPDK
-transport, kernel bypass, RSS pinning, or distributed multi-node scaling.
+completed variable-delta operations/second with a hard limit. It does **not**
+prove million-operations/second scale, DPDK, kernel bypass, RSS pinning, or
+distributed multi-node scaling.
 
 ## 1. Terms to know first
 
