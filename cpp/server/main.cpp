@@ -8,11 +8,13 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <system_error>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -37,6 +39,11 @@ struct ServerOptions {
     std::uint32_t handoff_leader{0};
     std::uint32_t strict_owner{0};
     std::vector<counter_poc::DistributedPeer> handoff_peers;
+    std::string handoff_auth_key_file;
+    std::string handoff_journal_path;
+    // The client-facing endpoint of --strict-owner. This can differ from the
+    // private control-plane UDP endpoint in --handoff-peer.
+    std::string strict_owner_endpoint;
 };
 
 template <typename Number>
@@ -75,6 +82,18 @@ bool parse_handoff_peer(std::string_view text, counter_poc::DistributedPeer& pee
     peer.host = std::string(text.substr(first_separator + 1, last_separator - first_separator - 1));
     peer.port = port;
     return !peer.host.empty();
+}
+
+bool read_secret_file(const std::string& path, std::vector<std::uint8_t>& secret) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    const std::vector<char> file_bytes((std::istreambuf_iterator<char>(input)),
+                                       std::istreambuf_iterator<char>());
+    if (input.bad() || file_bytes.size() < 16) return false;
+    secret.clear();
+    secret.reserve(file_bytes.size());
+    for (const char byte : file_bytes) secret.push_back(static_cast<std::uint8_t>(byte));
+    return true;
 }
 
 bool parse_options(int argc, char** argv, ServerOptions& options) {
@@ -117,6 +136,12 @@ bool parse_options(int argc, char** argv, ServerOptions& options) {
             counter_poc::DistributedPeer peer{};
             if (!parse_handoff_peer(value, peer)) return false;
             options.handoff_peers.push_back(std::move(peer));
+        } else if (const std::string_view value = value_after("--handoff-auth-key-file="); !value.empty()) {
+            options.handoff_auth_key_file = value;
+        } else if (const std::string_view value = value_after("--handoff-journal="); !value.empty()) {
+            options.handoff_journal_path = value;
+        } else if (const std::string_view value = value_after("--strict-owner-endpoint="); !value.empty()) {
+            options.strict_owner_endpoint = value;
         } else if (argument.starts_with("--")) {
             return false;
         } else {
@@ -146,7 +171,9 @@ void print_usage() {
                  " [--udp-bind-host=IPv4] [--udp-peer=IPv4:port]"
                  " [--handoff-bind-port=N] [--handoff-bind-host=IPv4]"
                  " [--handoff-leader=N] [--strict-owner=N]"
-                 " [--handoff-peer=component:IPv4:port]...\n";
+                 " [--handoff-peer=component:IPv4:port]..."
+                 " [--handoff-auth-key-file=PATH] [--handoff-journal=PATH]"
+                 " [--strict-owner-endpoint=IPv4:TCP_PORT]\n";
 }
 
 class LogLimitReachedPublisher final : public counter_poc::ILimitReachedPublisher {
@@ -173,8 +200,10 @@ bool write_all(int fd, const char* data, std::size_t size) noexcept {
 
 class ConnectionSession final {
 public:
-    ConnectionSession(int fd, counter_poc::CounterEngine& engine) noexcept
-        : fd_(fd), engine_(engine), route_sequence_(static_cast<std::uint64_t>(fd) << 32U) {}
+    ConnectionSession(int fd, counter_poc::CounterEngine& engine,
+                      const std::string& strict_owner_endpoint) noexcept
+        : fd_(fd), engine_(engine), strict_owner_endpoint_(strict_owner_endpoint),
+          route_sequence_(static_cast<std::uint64_t>(fd) << 32U) {}
 
     void run() noexcept {
         char buffer[4096];
@@ -190,11 +219,19 @@ public:
                 if (buffer[i] != '\n') continue;
 
                 const counter_poc::Result result = parse_and_apply(buffer + begin, buffer + i);
-                const char response[2] = {result.decision == counter_poc::Decision::Accepted
-                                               ? 'A'
-                                               : result.decision == counter_poc::Decision::Moved ? 'M' : 'R',
-                                          '\n'};
-                if (!write_all(fd_, response, sizeof(response))) {
+                bool sent = false;
+                if (result.decision == counter_poc::Decision::Moved &&
+                    !strict_owner_endpoint_.empty()) {
+                    const std::string response = "M " + strict_owner_endpoint_ + "\n";
+                    sent = write_all(fd_, response.data(), response.size());
+                } else {
+                    const char response[2] = {result.decision == counter_poc::Decision::Accepted
+                                                  ? 'A'
+                                                  : result.decision == counter_poc::Decision::Moved ? 'M' : 'R',
+                                              '\n'};
+                    sent = write_all(fd_, response, sizeof(response));
+                }
+                if (!sent) {
                     close(fd_);
                     return;
                 }
@@ -220,11 +257,13 @@ private:
 
     int fd_;
     counter_poc::CounterEngine& engine_;
+    const std::string& strict_owner_endpoint_;
     std::uint64_t route_sequence_;
 };
 
-void serve_connection(int fd, counter_poc::CounterEngine& engine) {
-    ConnectionSession(fd, engine).run();
+void serve_connection(int fd, counter_poc::CounterEngine& engine,
+                      const std::string& strict_owner_endpoint) {
+    ConnectionSession(fd, engine, strict_owner_endpoint).run();
 }
 
 }  // namespace
@@ -295,6 +334,10 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<counter_poc::DistributedHandoffController> handoff;
     if (options.handoff_bind_port != 0) {
+        if (options.handoff_auth_key_file.empty() || options.handoff_journal_path.empty()) {
+            std::cerr << "distributed handoff requires --handoff-auth-key-file and --handoff-journal\n";
+            return 2;
+        }
         counter_poc::DistributedHandoffConfig config{};
         config.component_id = options.component_id;
         config.leader_component_id = options.handoff_leader;
@@ -302,6 +345,11 @@ int main(int argc, char** argv) {
         config.bind_port = options.handoff_bind_port;
         config.bind_host = options.handoff_bind_host;
         config.peers = options.handoff_peers;
+        config.journal_path = options.handoff_journal_path;
+        if (!read_secret_file(options.handoff_auth_key_file, config.authentication_key)) {
+            std::cerr << "cannot read a handoff key with at least 16 bytes\n";
+            return 2;
+        }
         for (const auto& reservation : options.cluster_reservations)
             config.members.push_back(reservation.component_id);
         try {
@@ -312,8 +360,9 @@ int main(int argc, char** argv) {
             std::cerr << "cannot start distributed handoff: " << error.what() << '\n';
             return 2;
         }
-    } else if (!options.handoff_peers.empty()) {
-        std::cerr << "handoff peers require --handoff-bind-port\n";
+    } else if (!options.handoff_peers.empty() || !options.handoff_auth_key_file.empty() ||
+               !options.handoff_journal_path.empty() || !options.strict_owner_endpoint.empty()) {
+        std::cerr << "handoff options require --handoff-bind-port\n";
         return 2;
     }
     const int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -338,6 +387,8 @@ int main(int argc, char** argv) {
     std::cout << '\n';
     for (;;) {
         const int client = accept(listener, nullptr, nullptr);
-        if (client >= 0) std::thread(serve_connection, client, std::ref(engine)).detach();
+        if (client >= 0)
+            std::thread(serve_connection, client, std::ref(engine),
+                        std::cref(options.strict_owner_endpoint)).detach();
     }
 }

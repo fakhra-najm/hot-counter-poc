@@ -131,6 +131,33 @@ bool CounterEngine::commit_distributed_handoff(Amount global_total, bool strict_
     return true;
 }
 
+bool CounterEngine::recover_committed_handoff(const DrainedPeakState& state, Amount global_total,
+                                              bool strict_owner) noexcept {
+    if (global_total > strict_.limit()) return false;
+    close_and_drain();
+    if (!strict_.seed_after_quiescence(global_total)) return false;
+    active_counter_.store(state.counter, std::memory_order_relaxed);
+    has_active_counter_.store(true, std::memory_order_release);
+    // The next snapshot must not look older than the handoff that selected
+    // the strict owner. A wrap is not operationally realistic, but retaining
+    // the recorded epoch is still safer than silently resetting to zero.
+    replication_epoch_.store(state.epoch, std::memory_order_release);
+    routing_.publish(strict_owner ? RoutingMode::DangerStrict : RoutingMode::RemoteStrict);
+    exhausted_peak_shards_.store(0, std::memory_order_release);
+    distributed_handoff_active_.store(false, std::memory_order_release);
+    if (global_total == strict_.limit()) {
+        if (strict_owner) {
+            publish_limit_reached(state.counter);
+        } else {
+            exhausted_cache_.mark_exhausted();
+        }
+    }
+    admission_gate_.open();
+    return true;
+}
+
+void CounterEngine::fence_after_interrupted_handoff() noexcept { close_and_drain(); }
+
 bool CounterEngine::close_and_drain() noexcept {
     admission_gate_.close();
     while (!admission_gate_.drained()) std::this_thread::yield();

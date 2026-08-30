@@ -27,6 +27,12 @@ struct DistributedHandoffConfig {
     std::vector<std::uint32_t> members;
     // One endpoint for every other member.
     std::vector<DistributedPeer> peers;
+    // A raw secret with at least 128 bits of entropy. Every wire frame has a
+    // 128-bit truncated HMAC-SHA-256 tag; the data plane never reads this key.
+    std::vector<std::uint8_t> authentication_key;
+    // Per-node durable state. A prepared record fences a restart; a committed
+    // record restores the chosen strict owner before the listener opens.
+    std::string journal_path;
     std::chrono::milliseconds retry_after{10};
     std::chrono::milliseconds prepare_timeout{1000};
 };

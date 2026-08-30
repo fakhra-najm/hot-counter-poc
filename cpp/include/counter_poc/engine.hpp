@@ -50,6 +50,9 @@ public:
     Amount danger_threshold() const noexcept { return danger_threshold_; }
     Amount local_peak_reservation() const noexcept { return local_peak_reservation_; }
     Amount limit() const noexcept { return strict_.limit(); }
+    Amount current_value() const noexcept {
+        return routing_.mode() == RoutingMode::ReservedPeak ? reserved_.total() : strict_.value();
+    }
     Amount current_peak_total() const noexcept { return reserved_.total(); }
     std::uint64_t replication_epoch() const noexcept { return replication_epoch_.load(std::memory_order_acquire); }
     bool limit_exhausted() const noexcept { return exhausted_cache_.known_exhausted(); }
@@ -59,6 +62,14 @@ public:
     bool begin_distributed_handoff(DrainedPeakState& state) noexcept;
     void abort_distributed_handoff() noexcept;
     bool commit_distributed_handoff(Amount global_total, bool strict_owner) noexcept;
+    // Recovery API for a committed record written before the mode change. It
+    // is intentionally separate from commit_distributed_handoff(): recovery
+    // happens before the daemon starts accepting client connections.
+    bool recover_committed_handoff(const DrainedPeakState& state, Amount global_total,
+                                   bool strict_owner) noexcept;
+    // A prepared handoff without a durable decision is ambiguous after a
+    // crash. Keep the admission gate closed until an operator resolves it.
+    void fence_after_interrupted_handoff() noexcept;
 private:
     bool transition_to_reserved() noexcept;
     bool transition_to_danger() noexcept;

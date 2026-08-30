@@ -187,6 +187,11 @@ counter-poc/
 # Canonical C++ implementation
 make clean all test
 
+# Direct-engine microbenchmark. It writes CSV to stdout; redirect each run to
+# a separate evidence file rather than combining unlike environments.
+./cpp/build/counter_bench --mode=strict --threads=4 --shards=4 \
+  --duration-ms=15000 --limit=1000000000000 --min-delta=1 --max-delta=100
+
 # Earlier C benchmark harness
 make legacy-clean legacy-c legacy-test
 
@@ -203,28 +208,41 @@ The kernel reference server also supports a component ID, an explicitly
 validated static cluster allocation, and UDP snapshot peers:
 
 ```sh
+# Create a 256-bit binary control-plane key once per fixed cluster. Keep the
+# file readable only by the counterd service account; never pass it on a CLI.
+install -d -m 0700 /var/lib/counterd
+openssl rand -out /var/lib/counterd/handoff.key 32
+chmod 0600 /var/lib/counterd/handoff.key
+
 ./cpp/build/counterd 9090 1000000 4 100000 50000 peak \
   --component-id=0 --cluster-reservation=0:500000 \
   --cluster-reservation=1:500000 \
   --udp-bind-port=10090 --udp-peer=10.0.0.12:10090 \
   --handoff-bind-port=11090 --handoff-leader=0 --strict-owner=0 \
-  --handoff-peer=1:10.0.0.12:11090
+  --handoff-peer=1:10.0.0.12:11090 \
+  --handoff-auth-key-file=/var/lib/counterd/handoff.key \
+  --handoff-journal=/var/lib/counterd/component-0.handoff \
+  --strict-owner-endpoint=10.0.0.11:9090
 ```
 
 Every cluster member must use the same `--cluster-reservation` list. Each node
 binds a distinct handoff port and configures one `--handoff-peer` endpoint for
 every other member. When a component approaches its locally reserved low-water
 mark, the leader stops peak admissions everywhere, sums the drained totals, and
-commits the global value to `--strict-owner`. Non-owner TCP daemons then return
-`M` (`MOVED`) so the client/router can retry the strict owner. Before commit, a missing member
-causes a timeout/abort and peak mode reopens; after commit, retries continue so
-the cluster is not reopened in a split state.
+commits the global value to `--strict-owner`. Non-owner TCP daemons return
+`M IPv4:TCP_PORT` (`MOVED`) when `--strict-owner-endpoint` is set, so a
+client/router can retry without a separate owner lookup. Before commit, a
+missing member causes a timeout/abort and peak mode reopens; after commit,
+retries continue so the cluster is not reopened in a split state.
 
-The PoC validates control packets against the configured private IPv4 endpoint
-and component ID, but does **not** yet authenticate or persist handoff terms.
-Use a private security group for experiments. A production deployment needs
-mTLS/HMAC-style message authentication and durable handoff state before it can
-recover safely across controller or host restarts.
+Handoff control frames are HMAC-SHA-256 authenticated with a 128-bit tag and
+are also checked against the configured private IPv4 endpoint and component ID.
+Each node records `prepared` before sending `PREPARED`, and records `committed`
+before enabling strict mode. A restart with only a `prepared` record keeps its
+admission gate closed: an operator must reconcile that node instead of guessing
+whether the old leader committed. Use a private security group as an additional
+network boundary. Replication frames are still unauthenticated and remain an
+experiment-only observation channel, never an admission authority.
 
 | Claim | Status |
 | --- | --- |
@@ -236,7 +254,8 @@ recover safely across controller or host restarts.
 | Limit-exhausted edge signal/cache | Tested: only an accepted exact-limit request emits it. |
 | Roughly 70K completed TPS in the small-instance offered-load experiment | Demonstrated with the topology caveat above. |
 | Fixed-membership distributed barrier and handoff to one strict owner | Implemented and loopback-tested, including prepare timeout/abort behaviour. |
-| Crash recovery for an interrupted handoff | Not yet durable: production needs persisted term/state plus authenticated membership. |
+| Authenticated, durable handoff recovery | Implemented: HMAC protects control messages; a committed journal restores strict routing and an ambiguous prepared journal fences requests. |
+| C++ direct-engine CSV benchmark | Implemented for strict/local-peak/danger; it is not a network or DPDK result. |
 | Distributed CRDT admission | Deliberately not implemented: CRDT merge alone is unsafe for a hard limit. |
 | RSS pinning, huge pages, DPDK, kernel bypass | Optional code is implemented; hardware deployment and measurement are not validated. |
 | NIC/kernel bottleneck proof | Not done; needs matched instrumentation and saturation tests. |

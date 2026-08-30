@@ -1,4 +1,5 @@
 #include "counter_poc/engine.hpp"
+#include "counter_poc/auth.hpp"
 #include "counter_poc/distributed_handoff.hpp"
 #include "counter_poc/gcounter.hpp"
 #include "counter_poc/replication.hpp"
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <system_error>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 using namespace counter_poc;
 
@@ -37,6 +39,18 @@ bool eventually(Predicate&& predicate) {
 }  // namespace
 
 int main() {
+    const std::vector<std::uint8_t> hmac_key(20, 0x0bU);
+    const std::vector<std::uint8_t> hmac_message{'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e'};
+    const ControlAuthenticator::Tag expected_hmac = {
+        0xb0U, 0x34U, 0x4cU, 0x61U, 0xd8U, 0xdbU, 0x38U, 0x53U,
+        0x5cU, 0xa8U, 0xafU, 0xceU, 0xafU, 0x0bU, 0xf1U, 0x2bU};
+    const ControlAuthenticator::Tag hmac = ControlAuthenticator::sign(hmac_key, hmac_message);
+    assert(hmac == expected_hmac);
+    assert(ControlAuthenticator::verify(hmac_key, hmac_message, hmac));
+    std::vector<std::uint8_t> altered_message = hmac_message;
+    altered_message[0] = 'h';
+    assert(!ControlAuthenticator::verify(hmac_key, altered_message, hmac));
+
     StrictCounter strict(100); assert(strict.apply(95).decision==Decision::Accepted);
     assert(strict.apply(6).decision==Decision::Rejected); assert(strict.value()==95);
     assert(strict.apply(5).decision==Decision::Accepted && strict.value()==100);
@@ -78,6 +92,16 @@ int main() {
     assert(handoff_a.apply({17, 1, 0}).decision == Decision::Rejected);
     assert(handoff_b.apply({17, 1, 0}).decision == Decision::Moved);
 
+    CounterEngine recovered_owner({100, 1, 10, 1000000, 0, 45});
+    assert(recovered_owner.enter_reserved_mode_after_quiescence());
+    assert(recovered_owner.recover_committed_handoff({17, 4, 90}, 90, true));
+    assert(recovered_owner.mode() == RoutingMode::DangerStrict);
+    assert(recovered_owner.apply({17, 10, 0}).decision == Decision::Accepted);
+    CounterEngine interrupted({100, 1, 10, 1000000, 0, 45});
+    assert(interrupted.enter_reserved_mode_after_quiescence());
+    interrupted.fence_after_interrupted_handoff();
+    assert(interrupted.apply({17, 1, 0}).decision == Decision::Rejected);
+
     CounterEngine coordinated_a({100, 1, 10, 1000000, 0, 45});
     CounterEngine coordinated_b({100, 1, 10, 1000000, 1, 55});
     assert(coordinated_a.enter_reserved_mode_after_quiescence());
@@ -92,6 +116,8 @@ int main() {
     controller_a_config.bind_port = 32101;
     controller_a_config.members = {0, 1};
     controller_a_config.peers = {{1, "127.0.0.1", 32102}};
+    controller_a_config.authentication_key = std::vector<std::uint8_t>(32, 0xa5U);
+    controller_a_config.journal_path = "/tmp/counter-poc-handoff-a-" + std::to_string(getpid());
     controller_a_config.retry_after = std::chrono::milliseconds(2);
     controller_a_config.prepare_timeout = std::chrono::milliseconds(500);
     DistributedHandoffConfig controller_b_config{};
@@ -102,6 +128,8 @@ int main() {
     controller_b_config.bind_port = 32102;
     controller_b_config.members = {0, 1};
     controller_b_config.peers = {{0, "127.0.0.1", 32101}};
+    controller_b_config.authentication_key = controller_a_config.authentication_key;
+    controller_b_config.journal_path = "/tmp/counter-poc-handoff-b-" + std::to_string(getpid());
     controller_b_config.retry_after = std::chrono::milliseconds(2);
     controller_b_config.prepare_timeout = std::chrono::milliseconds(500);
     try {
@@ -133,6 +161,8 @@ int main() {
     timeout_config.bind_port = 32103;
     timeout_config.members = {0, 1};
     timeout_config.peers = {{1, "127.0.0.1", 32104}};
+    timeout_config.authentication_key = std::vector<std::uint8_t>(32, 0x5aU);
+    timeout_config.journal_path = "/tmp/counter-poc-handoff-timeout-" + std::to_string(getpid());
     timeout_config.retry_after = std::chrono::milliseconds(2);
     timeout_config.prepare_timeout = std::chrono::milliseconds(25);
     try {

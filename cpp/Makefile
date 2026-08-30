@@ -1,13 +1,15 @@
 CXX ?= c++
 CXXFLAGS = -O3 -std=c++20 -Wall -Wextra -Werror -pthread -Iinclude
 BUILD = build
-CORE = src/strict_counter.cpp src/reserved_counter.cpp src/reservation_plan.cpp src/routing.cpp src/gcounter.cpp src/hotkey_detector.cpp src/engine.cpp src/replication.cpp src/distributed_handoff.cpp src/transport.cpp
-all: $(BUILD)/counterd $(BUILD)/correctness
+CORE = src/strict_counter.cpp src/reserved_counter.cpp src/reservation_plan.cpp src/routing.cpp src/gcounter.cpp src/hotkey_detector.cpp src/engine.cpp src/replication.cpp src/auth.cpp src/distributed_handoff.cpp src/transport.cpp
+all: $(BUILD)/counterd $(BUILD)/correctness $(BUILD)/counter_bench
 $(BUILD):
 	mkdir -p $@
 $(BUILD)/counterd: $(CORE) server/main.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 $(BUILD)/correctness: $(CORE) tests/correctness.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+$(BUILD)/counter_bench: $(CORE) benchmark/main.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 test: $(BUILD)/correctness
 	$(BUILD)/correctness
