@@ -1,7 +1,9 @@
 // Optional Linux/DPDK data plane. It is intentionally a separate executable:
 // the normal daemon remains a transparent kernel-TCP baseline, while this
 // executable owns a dedicated NIC through a DPDK poll-mode driver.
-#include "counter_poc/engine.hpp"
+#include "counter_poc/runtime.hpp"
+#include "counter_poc/runtime_config.hpp"
+#include "counter_poc/udp_counter_protocol.hpp"
 
 extern "C" {
 #include <rte_arp.h>
@@ -16,6 +18,7 @@ extern "C" {
 #include <rte_udp.h>
 }
 
+#include <arpa/inet.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,18 +26,17 @@ extern "C" {
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace {
 
-constexpr std::uint32_t kWireMagic = 0x48435031U;  // HCP1
-constexpr std::uint8_t kWireVersion = 1;
-constexpr std::uint8_t kWireRequest = 1;
-constexpr std::uint8_t kWireAck = 2;
-constexpr std::size_t kWireSize = 32;
+constexpr std::size_t kWireSize = counter_poc::UdpCounterProtocol::kFrameSize;
 constexpr std::uint16_t kRxDescriptors = 1024;
 constexpr std::uint16_t kTxDescriptors = 1024;
 constexpr std::uint16_t kBurstSize = 32;
@@ -45,11 +47,13 @@ struct Options {
     std::uint16_t dpdk_port{0};
     std::uint16_t udp_port{9091};
     std::uint16_t queues{1};
-    counter_poc::Amount limit{1000000000000000ULL};
-    std::uint32_t shards{3};
-    counter_poc::Amount danger{100000ULL};
-    std::uint64_t hot_tps{50000ULL};
-    bool start_peak{false};
+    counter_poc::RuntimeLaunchOptions runtime;
+    std::string strict_owner_endpoint;
+};
+
+struct RedirectEndpoint {
+    std::uint32_t ipv4_host_order{};
+    std::uint16_t port{};
 };
 
 struct WorkerContext {
@@ -57,6 +61,7 @@ struct WorkerContext {
     std::uint16_t queue;
     std::uint16_t udp_port;
     counter_poc::CounterEngine* engine;
+    RedirectEndpoint redirect;
 };
 
 template <typename Number>
@@ -68,10 +73,6 @@ bool parse_number(std::string_view text, Number& destination) noexcept {
 bool parse_options(int argc, char** argv, Options& options) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
-        if (argument == "--start-peak") {
-            options.start_peak = true;
-            continue;
-        }
         const auto value_after = [&argument](std::string_view name) -> std::string_view {
             return argument.starts_with(name) ? argument.substr(name.size()) : std::string_view{};
         };
@@ -81,16 +82,12 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (!parse_number(value, options.udp_port) || options.udp_port == 0) return false;
         } else if (const auto value = value_after("--queues="); !value.empty()) {
             if (!parse_number(value, options.queues) || options.queues == 0) return false;
-        } else if (const auto value = value_after("--limit="); !value.empty()) {
-            if (!parse_number(value, options.limit)) return false;
-        } else if (const auto value = value_after("--shards="); !value.empty()) {
-            if (!parse_number(value, options.shards) || options.shards == 0) return false;
-        } else if (const auto value = value_after("--danger-threshold="); !value.empty()) {
-            if (!parse_number(value, options.danger)) return false;
-        } else if (const auto value = value_after("--hot-tps="); !value.empty()) {
-            if (!parse_number(value, options.hot_tps) || options.hot_tps == 0) return false;
-        } else {
+        } else if (const auto value = value_after("--strict-owner-endpoint="); !value.empty()) {
+            options.strict_owner_endpoint = value;
+        } else if (!counter_poc::parse_runtime_option(argument, options.runtime)) {
             return false;
+        } else {
+            continue;
         }
     }
     return true;
@@ -99,28 +96,26 @@ bool parse_options(int argc, char** argv, Options& options) {
 void usage() {
     std::cerr << "usage: counterd_dpdk EAL_OPTIONS -- [--dpdk-port=N] [--udp-port=N]"
                  " [--queues=N] [--limit=N] [--shards=N] [--danger-threshold=N]"
-                 " [--hot-tps=N] [--start-peak]\n";
+                 " [--hot-tps=N] [--start-peak] [--component-id=N]"
+                 " [--peak-reservation=N] [--cluster-reservation=component:capacity]..."
+                 " [--udp-bind-port=N] [--udp-bind-host=IPv4] [--udp-peer=IPv4:port]..."
+                 " [--handoff-bind-port=N] [--handoff-bind-host=IPv4]"
+                 " [--handoff-leader=N] [--strict-owner=N]"
+                 " [--handoff-peer=component:IPv4:port]..."
+                 " [--handoff-auth-key-file=PATH] [--handoff-journal=PATH]"
+                 " [--strict-owner-endpoint=IPv4:UDP_PORT]\n";
 }
 
-std::uint32_t read_u32(const std::uint8_t* source, std::size_t offset) noexcept {
-    return (static_cast<std::uint32_t>(source[offset]) << 24U) |
-           (static_cast<std::uint32_t>(source[offset + 1]) << 16U) |
-           (static_cast<std::uint32_t>(source[offset + 2]) << 8U) |
-           static_cast<std::uint32_t>(source[offset + 3]);
-}
-
-std::uint64_t read_u64(const std::uint8_t* source, std::size_t offset) noexcept {
-    std::uint64_t value = 0;
-    for (std::size_t index = 0; index < sizeof(value); ++index)
-        value = (value << 8U) | source[offset + index];
-    return value;
-}
-
-void write_u64(std::uint8_t* destination, std::size_t offset, std::uint64_t value) noexcept {
-    for (std::size_t index = 0; index < sizeof(value); ++index) {
-        const std::size_t shift = (sizeof(value) - 1U - index) * 8U;
-        destination[offset + index] = static_cast<std::uint8_t>(value >> shift);
-    }
+bool parse_redirect_endpoint(const std::string& text, RedirectEndpoint& endpoint) {
+    const std::size_t separator = text.rfind(':');
+    if (separator == std::string::npos || separator == 0 || separator + 1 == text.size()) return false;
+    std::uint16_t port = 0;
+    if (!parse_number(std::string_view(text).substr(separator + 1), port) || port == 0) return false;
+    in_addr address{};
+    const std::string host = text.substr(0, separator);
+    if (inet_pton(AF_INET, host.c_str(), &address) != 1) return false;
+    endpoint = {ntohl(address.s_addr), port};
+    return true;
 }
 
 void reverse_ethernet(rte_ether_hdr* ethernet) noexcept {
@@ -169,14 +164,12 @@ bool process_udp_request(rte_mbuf* packet, const WorkerContext& context) noexcep
     if (rte_be_to_cpu_16(udp->dst_port) != context.udp_port) return false;
     auto* payload = rte_pktmbuf_mtod_offset(packet, std::uint8_t*,
                                             sizeof(rte_ether_hdr) + ip_length + sizeof(rte_udp_hdr));
-    if (read_u32(payload, 0) != kWireMagic || payload[4] != kWireVersion ||
-        payload[5] != kWireRequest)
+    counter_poc::UdpCounterProtocol::Request request{};
+    if (!counter_poc::UdpCounterProtocol::decode_request(
+            std::span<const std::uint8_t>(payload, kWireSize), request))
         return false;
-
-    const std::uint64_t request_id = read_u64(payload, 8);
-    const counter_poc::Amount delta = read_u64(payload, 16);
-    const counter_poc::CounterId counter = read_u64(payload, 24);
-    const counter_poc::Result result = context.engine->apply({counter, delta, request_id});
+    const counter_poc::Result result =
+        context.engine->apply({request.counter, request.delta, request.request_id});
 
     reverse_ethernet(ethernet);
     const rte_be32_t source_ip = ip->src_addr;
@@ -185,14 +178,10 @@ bool process_udp_request(rte_mbuf* packet, const WorkerContext& context) noexcep
     const rte_be16_t source_port = udp->src_port;
     udp->src_port = udp->dst_port;
     udp->dst_port = source_port;
-    payload[5] = kWireAck;
-    payload[6] = result.decision == counter_poc::Decision::Accepted
-                     ? 1U
-                     : result.decision == counter_poc::Decision::Moved ? 2U : 0U;
-    payload[7] = 0;
-    write_u64(payload, 8, request_id);
-    write_u64(payload, 16, result.observed);
-    write_u64(payload, 24, counter);
+    const auto reply = counter_poc::UdpCounterProtocol::encode_reply(
+        {request.request_id, result, request.counter, context.redirect.ipv4_host_order,
+         context.redirect.port});
+    std::copy(reply.begin(), reply.end(), payload);
     ip->hdr_checksum = 0;
     ip->hdr_checksum = rte_ipv4_cksum(ip);
     // A zero UDP checksum is valid for IPv4. It avoids a software checksum in
@@ -269,6 +258,11 @@ int setup_port(std::uint16_t port, std::uint16_t queues, rte_mempool* pool) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const char* const transport = std::getenv("COUNTER_TRANSPORT");
+    if (transport != nullptr && std::string_view(transport) != "dpdk") {
+        std::cerr << "counterd_dpdk requires COUNTER_TRANSPORT=dpdk (or no setting)\n";
+        return 2;
+    }
     const int consumed = rte_eal_init(argc, argv);
     if (consumed < 0) return 2;
     argc -= consumed;
@@ -290,19 +284,34 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    counter_poc::CounterEngine engine(options.limit, options.shards, options.danger, options.hot_tps);
-    if (options.start_peak && !engine.enter_reserved_mode_after_quiescence()) {
-        std::cerr << "cannot enter initial peak mode\n";
+    RedirectEndpoint redirect{};
+    if (!options.strict_owner_endpoint.empty() &&
+        !parse_redirect_endpoint(options.strict_owner_endpoint, redirect)) {
+        std::cerr << "strict owner endpoint must be IPv4:UDP_PORT\n";
+        rte_eth_dev_stop(options.dpdk_port);
+        rte_eth_dev_close(options.dpdk_port);
+        rte_eal_cleanup();
         return 2;
     }
-    engine.start_control_plane();
+    std::unique_ptr<counter_poc::CounterRuntime> runtime;
+    try {
+        runtime = std::make_unique<counter_poc::CounterRuntime>(
+            counter_poc::make_runtime_config(options.runtime));
+        runtime->start();
+    } catch (const std::exception& error) {
+        std::cerr << "cannot start DPDK counter runtime: " << error.what() << '\n';
+        rte_eth_dev_stop(options.dpdk_port);
+        rte_eth_dev_close(options.dpdk_port);
+        rte_eal_cleanup();
+        return 2;
+    }
     std::signal(SIGINT, stop_handler);
     std::signal(SIGTERM, stop_handler);
 
     std::vector<WorkerContext> contexts;
     contexts.reserve(options.queues);
     for (std::uint16_t queue = 0; queue < options.queues; ++queue)
-        contexts.push_back({options.dpdk_port, queue, options.udp_port, &engine});
+        contexts.push_back({options.dpdk_port, queue, options.udp_port, &runtime->engine(), redirect});
 
     std::uint16_t queue = 1;
     unsigned lcore_id = 0;
@@ -324,7 +333,7 @@ int main(int argc, char** argv) {
     RTE_LCORE_FOREACH_WORKER(lcore_id) {
         rte_eal_wait_lcore(lcore_id);
     }
-    engine.stop_control_plane();
+    runtime->stop();
     rte_eth_dev_stop(options.dpdk_port);
     rte_eth_dev_close(options.dpdk_port);
     rte_eal_cleanup();

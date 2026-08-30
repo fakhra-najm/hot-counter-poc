@@ -30,6 +30,8 @@ an external gate requires the EC2/DPDK environment or a measured result.
 
 ## C. Data plane and observability
 
+- [x] Extract `CounterRuntime` as the shared engine/control-plane product;
+      TCP and DPDK adapters now start the same runtime configuration.
 - [x] Kernel-TCP baseline daemon and fixed-frame DPDK UDP daemon.
 - [x] RSS queue-per-lcore DPDK setup code and UDP smoke client.
 - [ ] Export accepted/rejected/moved, mode, handoff, replication, queue-drop, and

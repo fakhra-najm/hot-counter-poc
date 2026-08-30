@@ -12,6 +12,11 @@ multi-node peak capacity, a fixed-membership UDP handoff barrier, asynchronous
 UDP snapshot replication with ACKs, and an optional DPDK/RSS UDP server. It does **not** prove million-operations/second
 scale, or validate DPDK/RSS on an EC2 NIC, until those experiments are run.
 
+`CounterRuntime` is the shared product boundary: TCP and DPDK adapters invoke
+the same engine, optional replication, and authenticated handoff lifecycle.
+Only the data-plane framing and NIC path differ. See the
+[TCP and DPDK transport runbook](docs/TRANSPORT_RUNBOOK.md).
+
 ## 1. Terms to know first
 
 | Term | Plain meaning | Why it matters here | Reference |
@@ -175,7 +180,8 @@ counter-poc/
 | Area | Purpose |
 | --- | --- |
 | `cpp/include/counter_poc/` | Interfaces and domain types. |
-| `cpp/src/` | Strict counter, reservations, routing, detector, mode controller, and UDP replication. |
+| `cpp/src/` | Shared runtime product, strict counter, reservations, routing, detector, control plane, TCP adapter, and UDP replication. |
+| `cpp/include/counter_poc/udp_counter_protocol.hpp` | Fixed 40-byte DPDK UDP request/reply protocol, shared by the DPDK adapter and smoke client. |
 | `cpp/server/` | Transparent POSIX/TCP reference server; not a production network stack. |
 | `cpp/tests/` | Hard-limit, CAS, reservation, merge, and transition tests. |
 | `cpp/dpdk/` | DPDK poll-mode/RSS UDP daemon, kernel UDP smoke client, and deployment checklist. |
@@ -199,7 +205,7 @@ make legacy-clean legacy-c legacy-test
 make -C cpp dpdk dpdk-client
 ```
 
-The DPDK request payload is a fixed 32-byte UDP frame. `counterd_dpdk` handles
+The DPDK request payload is a fixed 40-byte UDP frame. `counterd_dpdk` handles
 ARP plus IPv4/UDP requests and returns an ACK in-place; `counterd_udp_client`
 is a one-request smoke client. Start it only after the dedicated ENI has been
 bound to DPDK and its management ENI remains under the kernel driver.

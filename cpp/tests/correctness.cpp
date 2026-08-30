@@ -5,7 +5,10 @@
 #include "counter_poc/replication.hpp"
 #include "counter_poc/reservation_plan.hpp"
 #include "counter_poc/reserved_counter.hpp"
+#include "counter_poc/runtime.hpp"
+#include "counter_poc/runtime_config.hpp"
 #include "counter_poc/strict_counter.hpp"
+#include "counter_poc/udp_counter_protocol.hpp"
 #include <chrono>
 #include <cassert>
 #include <iostream>
@@ -51,6 +54,20 @@ int main() {
     altered_message[0] = 'h';
     assert(!ControlAuthenticator::verify(hmac_key, altered_message, hmac));
 
+    const auto encoded_udp_request = UdpCounterProtocol::encode_request({9, 25, 17});
+    UdpCounterProtocol::Request decoded_udp_request{};
+    assert(UdpCounterProtocol::decode_request(encoded_udp_request, decoded_udp_request));
+    assert(decoded_udp_request.request_id == 9 && decoded_udp_request.delta == 25 &&
+           decoded_udp_request.counter == 17);
+    const auto encoded_udp_reply = UdpCounterProtocol::encode_reply(
+        {9, {Decision::Moved, 75, 0}, 17, 0x0a00000bU, 9091});
+    UdpCounterProtocol::Reply decoded_udp_reply{};
+    assert(UdpCounterProtocol::decode_reply(encoded_udp_reply, decoded_udp_reply));
+    assert(decoded_udp_reply.result.decision == Decision::Moved &&
+           decoded_udp_reply.result.observed == 75 &&
+           decoded_udp_reply.strict_owner_ipv4 == 0x0a00000bU &&
+           decoded_udp_reply.strict_owner_port == 9091);
+
     StrictCounter strict(100); assert(strict.apply(95).decision==Decision::Accepted);
     assert(strict.apply(6).decision==Decision::Rejected); assert(strict.value()==95);
     assert(strict.apply(5).decision==Decision::Accepted && strict.value()==100);
@@ -63,6 +80,22 @@ int main() {
     assert(reserved.total()==100);
     ReservationPlan plan(100, {{0, 45}, {1, 55}});
     assert(plan.allocated_total() == 100 && plan.capacity_for(0) == 45);
+    RuntimeLaunchOptions shared_runtime_options{};
+    shared_runtime_options.limit = 100;
+    shared_runtime_options.shards = 1;
+    shared_runtime_options.danger_threshold = 10;
+    shared_runtime_options.hot_threshold_tps = 1000000;
+    shared_runtime_options.component_id = 1;
+    shared_runtime_options.start_peak = true;
+    shared_runtime_options.cluster_reservations = {{0, 45}, {1, 55}};
+    CounterRuntimeConfig shared_runtime_config = make_runtime_config(shared_runtime_options);
+    assert(shared_runtime_config.engine.local_peak_reservation == 55);
+    assert(shared_runtime_config.handoff == std::nullopt);
+    CounterRuntime shared_runtime(std::move(shared_runtime_config));
+    shared_runtime.start();
+    assert(shared_runtime.engine().mode() == RoutingMode::ReservedPeak);
+    assert(shared_runtime.engine().apply({1, 55, 0}).decision == Decision::Accepted);
+    shared_runtime.stop();
     CounterEngine peak_a({100, 1, 10, 1000000, 0, plan.capacity_for(0)});
     CounterEngine peak_b({100, 1, 10, 1000000, 1, plan.capacity_for(1)});
     assert(peak_a.enter_reserved_mode_after_quiescence());
@@ -148,6 +181,55 @@ int main() {
         assert(error.code() == std::errc::operation_not_permitted ||
                error.code() == std::errc::permission_denied);
         std::cerr << "distributed handoff integration skipped: " << error.what() << '\n';
+    }
+
+    CounterRuntimeConfig runtime_handoff_a_config{{100, 1, 10, 1000000, 0, 45}, true,
+                                                  std::nullopt, std::nullopt};
+    CounterRuntimeConfig runtime_handoff_b_config{{100, 1, 10, 1000000, 1, 55}, true,
+                                                  std::nullopt, std::nullopt};
+    DistributedHandoffConfig runtime_handoff_a_control{};
+    runtime_handoff_a_control.component_id = 0;
+    runtime_handoff_a_control.leader_component_id = 0;
+    runtime_handoff_a_control.strict_owner_component_id = 0;
+    runtime_handoff_a_control.bind_host = "127.0.0.1";
+    runtime_handoff_a_control.bind_port = 32105;
+    runtime_handoff_a_control.members = {0, 1};
+    runtime_handoff_a_control.peers = {{1, "127.0.0.1", 32106}};
+    runtime_handoff_a_control.authentication_key = std::vector<std::uint8_t>(32, 0x3cU);
+    runtime_handoff_a_control.journal_path =
+        "/tmp/counter-poc-runtime-handoff-a-" + std::to_string(getpid());
+    runtime_handoff_a_control.retry_after = std::chrono::milliseconds(2);
+    runtime_handoff_a_control.prepare_timeout = std::chrono::milliseconds(500);
+    DistributedHandoffConfig runtime_handoff_b_control{};
+    runtime_handoff_b_control.component_id = 1;
+    runtime_handoff_b_control.leader_component_id = 0;
+    runtime_handoff_b_control.strict_owner_component_id = 0;
+    runtime_handoff_b_control.bind_host = "127.0.0.1";
+    runtime_handoff_b_control.bind_port = 32106;
+    runtime_handoff_b_control.members = {0, 1};
+    runtime_handoff_b_control.peers = {{0, "127.0.0.1", 32105}};
+    runtime_handoff_b_control.authentication_key = runtime_handoff_a_control.authentication_key;
+    runtime_handoff_b_control.journal_path =
+        "/tmp/counter-poc-runtime-handoff-b-" + std::to_string(getpid());
+    runtime_handoff_b_control.retry_after = std::chrono::milliseconds(2);
+    runtime_handoff_b_control.prepare_timeout = std::chrono::milliseconds(500);
+    runtime_handoff_a_config.handoff = std::move(runtime_handoff_a_control);
+    runtime_handoff_b_config.handoff = std::move(runtime_handoff_b_control);
+    try {
+        CounterRuntime runtime_handoff_a(std::move(runtime_handoff_a_config));
+        CounterRuntime runtime_handoff_b(std::move(runtime_handoff_b_config));
+        runtime_handoff_a.start();
+        runtime_handoff_b.start();
+        assert(runtime_handoff_a.engine().apply({29, 40, 0}).decision == Decision::Accepted);
+        assert(runtime_handoff_b.engine().apply({29, 50, 0}).decision == Decision::Accepted);
+        assert(eventually([&] {
+            return runtime_handoff_a.engine().mode() == RoutingMode::DangerStrict &&
+                   runtime_handoff_b.engine().mode() == RoutingMode::RemoteStrict;
+        }));
+    } catch (const std::system_error& error) {
+        assert(error.code() == std::errc::operation_not_permitted ||
+               error.code() == std::errc::permission_denied);
+        std::cerr << "shared runtime handoff integration skipped: " << error.what() << '\n';
     }
 
     CounterEngine timeout_a({100, 1, 10, 1000000, 0, 45});
