@@ -8,7 +8,11 @@ bool HotKeyDetector::record(CounterId counter, std::uint64_t timestamp_ns) noexc
     if (queue_.try_push({counter,timestamp_ns})) return true;
     dropped_.fetch_add(1,std::memory_order_relaxed); return false;
 }
-void HotKeyDetector::start() { if (!worker_.joinable()) worker_=std::thread(&HotKeyDetector::run,this); }
+void HotKeyDetector::start() {
+    if (worker_.joinable()) return;
+    stop_.store(false, std::memory_order_release);
+    worker_ = std::thread(&HotKeyDetector::run, this);
+}
 void HotKeyDetector::stop() { stop_.store(true,std::memory_order_release); if (worker_.joinable()) worker_.join(); }
 void HotKeyDetector::run() {
     std::unordered_map<CounterId,std::uint64_t> counts;

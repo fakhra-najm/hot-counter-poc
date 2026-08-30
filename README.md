@@ -6,9 +6,11 @@ A C++20 proof of concept for one question:
 > **variable-delta operations per second** while preserving a hard limit?
 
 **Current boundary:** the small-instance experiment demonstrated roughly 70K
-completed variable-delta operations/second with a hard limit. It does **not**
-prove million-operations/second scale, DPDK, kernel bypass, RSS pinning, or
-distributed multi-node scaling.
+completed variable-delta operations/second with a hard limit. The repository
+now contains automatic local peak/danger transitions, escrow plans for
+multi-node peak capacity, a fixed-membership UDP handoff barrier, asynchronous
+UDP snapshot replication with ACKs, and an optional DPDK/RSS UDP server. It does **not** prove million-operations/second
+scale, or validate DPDK/RSS on an EC2 NIC, until those experiments are run.
 
 ## 1. Terms to know first
 
@@ -17,8 +19,8 @@ distributed multi-node scaling.
 | Atomic operation | An update appears to happen as one indivisible step. | A request must not read, check, and update as three separately raceable actions. | [Compare-and-swap](https://en.wikipedia.org/wiki/Compare-and-swap) |
 | Hot key | One logical key receives much more traffic than other keys. | Many transactions contend for the same merchant or account limit. | No standalone Wikipedia article; defined in section 2. |
 | Data plane | The path that decides `ACCEPT` or `REJECT`. | It must not wait for sampling or reconfiguration. | [Data plane](https://en.wikipedia.org/wiki/Data_plane) |
-| Control plane | Background work that changes how later requests should be routed. | It detects a hot key and requests a safe mode change. | [Data plane](https://en.wikipedia.org/wiki/Data_plane) |
-| DPDK | A userspace packet-processing toolkit with NIC poll-mode drivers. | Possible future transport optimisation; not enabled in this PoC. | [Data Plane Development Kit](https://en.wikipedia.org/wiki/Data_Plane_Development_Kit) |
+| Control plane | Background work that changes how later requests should be routed. | It detects a hot key and safely changes local mode after admissions drain. | [Data plane](https://en.wikipedia.org/wiki/Data_plane) |
+| DPDK | A userspace packet-processing toolkit with NIC poll-mode drivers. | Optional UDP/RSS backend; requires a Linux host, huge pages, and a dedicated NIC. | [Data Plane Development Kit](https://en.wikipedia.org/wiki/Data_Plane_Development_Kit) |
 | Kernel bypass | A userspace process accesses a NIC more directly than the normal kernel networking path. | It can reduce packet-path overhead at high packet rates; it does not remove counter-state contention. | No standalone Wikipedia article; see [operating-system kernel](https://en.wikipedia.org/wiki/Kernel_(operating_system)). |
 | CRDT | A replicated type whose replicas can merge concurrent state and converge. | Useful for convergence; insufficient alone for a hard financial cap. | [Conflict-free replicated data type](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type) |
 | Eventual consistency | Replicas may temporarily differ and later converge after updates are exchanged. | Convergence is not the same as safe financial admission. | [Eventual consistency](https://en.wikipedia.org/wiki/Eventual_consistency) |
@@ -76,13 +78,13 @@ directly comparable to the C++ result.
 | Step | Current PoC behaviour | Source / certainty |
 | ---: | --- | --- |
 | 1 | Client writes one decimal `delta` plus newline on a persistent TCP connection. | `benchmark/offered_benchmark.c` |
-| 2 | Client uses the normal operating-system TCP socket path. | DPDK is not enabled. |
+| 2 | Client uses the normal operating-system TCP socket path. | This is the measured baseline. |
 | 3 | Guest network interface and AWS virtual network carry the packet to the server. | Physical NIC chip, driver, and RSS queue count were **not recorded**. |
 | 4 | Server kernel delivers TCP data to a socket. | `accept`, `read`, and `write` are used. |
 | 5 | `ConnectionSession` parses the line and creates a request. | `cpp/server/main.cpp` |
 | 6 | `CounterEngine` selects strict or reserved-peak handling. | `cpp/src/engine.cpp` |
 | 7 | A counter runs an atomic acceptance check, then replies `A` or `R`. | `StrictCounter` or `ReservedCounter` |
-| 8 | Reply returns through normal kernel TCP and the network path. | Kernel bypass is not used. |
+| 8 | Reply returns through normal kernel TCP and the network path. | Kernel bypass is not used by this baseline. |
 
 Do not claim an exact “NIC chip” for this run without evidence. A future
 network experiment must record `ethtool -i`, `ethtool -l`, `lspci -nnk`, CPU
@@ -95,7 +97,7 @@ affinity, and ENA queue configuration before claiming an RSS or NIC bottleneck.
 | Plane | Job | Can it block a transaction? | Current status |
 | --- | --- | --- | --- |
 | Data plane | Parse request, select mode, execute `INCRNCHK`, reply. | No. | Implemented. |
-| Control plane | Sample traffic, detect a hot key, request a transition, coordinate it later. | No. | Detector and flags exist; no distributed coordinator. |
+| Control plane | Sample traffic, detect a hot key, and close/drain admissions before publishing a local mode change. | No. | Implemented for one process. |
 
 ### Current design vocabulary
 
@@ -109,7 +111,12 @@ affinity, and ENA queue configuration before claiming an RSS or NIC bottleneck.
 | Reserved counter | `ReservedCounter` | Each internal component owns a fixed, non-overlapping portion of the limit. | [reserved_counter.hpp](cpp/include/counter_poc/reserved_counter.hpp) |
 | Routing mode | `RoutingMode` | `Strict`, `ReservedPeak`, or `DangerStrict`. | [types.hpp](cpp/include/counter_poc/types.hpp) |
 | Danger zone | `danger_transition_requested()` | Signals that the remaining capacity is near the configured threshold. | [engine.hpp](cpp/include/counter_poc/engine.hpp) |
-| Transport seam | `ITransport` | Future place for epoll, io_uring, or DPDK transport. | [transport.hpp](cpp/include/counter_poc/transport.hpp) |
+| Admission gate | `AdmissionGate` | Rejects new local work while a mode change waits for in-flight operations to finish. | [admission_gate.hpp](cpp/include/counter_poc/admission_gate.hpp) |
+| Reservation plan | `ReservationPlan` | Validates non-overlapping capacity ownership across peak components. | [reservation_plan.hpp](cpp/include/counter_poc/reservation_plan.hpp) |
+| UDP replicator | `ReliableUdpReplicator` | Sends monotonic component snapshots; a receiver max-merges them and replies with an ACK. | [replication.hpp](cpp/include/counter_poc/replication.hpp) |
+| Limit-reached cache | `LimitReachedCache` | Caches only an exact exhausted state and emits the event only for the accepting operation. | [limit_reached.hpp](cpp/include/counter_poc/limit_reached.hpp) |
+| Distributed handoff | `DistributedHandoffController` | Collects drained component totals, installs one strict owner, and makes other nodes return `MOVED`. | [distributed_handoff.hpp](cpp/include/counter_poc/distributed_handoff.hpp) |
+| Transport seam | `ITransport` | Interface boundary for alternative transports; the DPDK executable currently has its own fixed UDP protocol. | [transport.hpp](cpp/include/counter_poc/transport.hpp) |
 
 ## 6. Accuracy versus eventual consistency
 
@@ -127,20 +134,26 @@ work.
 
 | Component | Eventual convergence? | Can it authorize a hard limit alone? | Current use |
 | --- | --- | --- | --- |
-| `GCounter` | Yes, through per-component maximum merge. | No. Separate replicas can each accept from incomplete knowledge. | Demonstration type and merge tests; no replication network path. |
-| `ReservedCounter` | Does not rely on eventual convergence to accept a request. | Yes, when reservations do not overlap and the transition is quiescent. | Current safe-peak implementation inside one process. |
+| `GCounter` / UDP component snapshots | Yes, through per-component maximum merge. | No. Separate replicas can each accept from incomplete knowledge. | `ReliableUdpReplicator` sends cumulative snapshots and bounds retry work with ACKs. |
+| `ReservedCounter` | Does not rely on eventual convergence to accept a request. | Yes, when reservations do not overlap and the transition is quiescent. | Safe local execution lanes and statically allocated multi-node peak capacity. |
 | `StrictCounter` | Not applicable; one authority has the value. | Yes. | Current normal and danger handling. |
 
 **Accurate statement:** the PoC gives hard-limit decisions through strict CAS
-or pre-reserved capacity. It does **not** yet implement an eventually
-consistent, replicated financial admission system.
+or pre-reserved capacity. UDP/CRDT state is asynchronous observation and
+recovery data, not the authority that admits a financial operation.
 
 ## 7. Safe transition rules
 
 | From | To | Coordinator must do | Automatic in `counterd`? |
 | --- | --- | --- | --- |
-| Strict | Reserved peak | Stop admissions for that counter; wait for old requests; seed reservations with exact strict value; publish route. | No. Tests call the transition after quiescence. |
-| Reserved peak | Danger strict | Stop admissions; wait for peak requests; total reservations; seed strict value; publish route. | No. Engine can raise a danger request; no server coordinator consumes it. |
+| Strict | Reserved peak | Close the local admission gate; wait for old requests; seed reservations with exact strict value; publish route. | Yes, when the detector threshold is crossed. |
+| Reserved peak | Danger strict | Close the local admission gate; wait for peak requests; total reservations; seed strict value; publish route. | Yes for one process that owns the full limit. |
+| Distributed reserved peak | One strict owner | Fixed-membership UDP `prepare`, drained-total collection, `commit`, and commit acknowledgement. | Yes, when every member is configured with the same plan and control peers. |
+
+A process using only a component reservation starts directly in peak mode. Its
+cluster reservation plan must sum to at most the global limit. This prevents
+false allows, but can create false rejects when one component has no capacity
+while another component still has some.
 
 ## 8. Codebase structure
 
@@ -148,10 +161,10 @@ consistent, replicated financial admission system.
 counter-poc/
 ├── cpp/                         canonical C++20 implementation
 │   ├── include/counter_poc/      interfaces and domain types
-│   ├── src/                     counter, routing, detector, engine
+│   ├── src/                     counter, routing, detector, engine, replication
 │   ├── server/                  kernel-TCP reference daemon
 │   ├── tests/                   correctness tests
-│   └── dpdk/                    requirements, not a DPDK transport
+│   └── dpdk/                    optional DPDK/RSS UDP daemon and smoke client
 ├── benchmark/                   earlier C benchmark programs
 ├── src/                         earlier C harness retained for comparison
 ├── tests/                       earlier C correctness test
@@ -162,10 +175,10 @@ counter-poc/
 | Area | Purpose |
 | --- | --- |
 | `cpp/include/counter_poc/` | Interfaces and domain types. |
-| `cpp/src/` | Strict counter, reservations, routing, detector, engine. |
+| `cpp/src/` | Strict counter, reservations, routing, detector, mode controller, and UDP replication. |
 | `cpp/server/` | Transparent POSIX/TCP reference server; not a production network stack. |
 | `cpp/tests/` | Hard-limit, CAS, reservation, merge, and transition tests. |
-| `cpp/dpdk/` | Future ENA, huge-page, RSS, and DPDK checklist. |
+| `cpp/dpdk/` | DPDK poll-mode/RSS UDP daemon, kernel UDP smoke client, and deployment checklist. |
 | `benchmark/`, `src/`, `tests/` | Earlier C baseline tools; not the canonical C++ design. |
 
 ## 9. Build and current scope
@@ -176,14 +189,54 @@ make clean all test
 
 # Earlier C benchmark harness
 make legacy-clean legacy-c legacy-test
+
+# Optional Linux DPDK backend (requires pkg-config libdpdk)
+make -C cpp dpdk dpdk-client
 ```
+
+The DPDK request payload is a fixed 32-byte UDP frame. `counterd_dpdk` handles
+ARP plus IPv4/UDP requests and returns an ACK in-place; `counterd_udp_client`
+is a one-request smoke client. Start it only after the dedicated ENI has been
+bound to DPDK and its management ENI remains under the kernel driver.
+
+The kernel reference server also supports a component ID, an explicitly
+validated static cluster allocation, and UDP snapshot peers:
+
+```sh
+./cpp/build/counterd 9090 1000000 4 100000 50000 peak \
+  --component-id=0 --cluster-reservation=0:500000 \
+  --cluster-reservation=1:500000 \
+  --udp-bind-port=10090 --udp-peer=10.0.0.12:10090 \
+  --handoff-bind-port=11090 --handoff-leader=0 --strict-owner=0 \
+  --handoff-peer=1:10.0.0.12:11090
+```
+
+Every cluster member must use the same `--cluster-reservation` list. Each node
+binds a distinct handoff port and configures one `--handoff-peer` endpoint for
+every other member. When a component approaches its locally reserved low-water
+mark, the leader stops peak admissions everywhere, sums the drained totals, and
+commits the global value to `--strict-owner`. Non-owner TCP daemons then return
+`M` (`MOVED`) so the client/router can retry the strict owner. Before commit, a missing member
+causes a timeout/abort and peak mode reopens; after commit, retries continue so
+the cluster is not reopened in a split state.
+
+The PoC validates control packets against the configured private IPv4 endpoint
+and component ID, but does **not** yet authenticate or persist handoff terms.
+Use a private security group for experiments. A production deployment needs
+mTLS/HMAC-style message authentication and durable handoff state before it can
+recover safely across controller or host restarts.
 
 | Claim | Status |
 | --- | --- |
 | Local atomic variable-delta limit enforcement | Tested. |
+| Automatic local peak and danger transitions with admission draining | Tested. |
 | Safe local reservation-based peak mode | Tested. |
+| Validated static multi-node escrow allocation | Tested in-process; deployment requires identical plan on every node. |
+| UDP monotonic snapshot replication, duplicate-safe merge, ACK/retry protocol | Implemented; integration test runs when socket binding is allowed. |
+| Limit-exhausted edge signal/cache | Tested: only an accepted exact-limit request emits it. |
 | Roughly 70K completed TPS in the small-instance offered-load experiment | Demonstrated with the topology caveat above. |
-| Automatic hot-key migration and danger return | Not end-to-end implemented. |
-| Async replication, failure recovery, distributed CRDT admission | Not implemented. |
-| RSS pinning, huge pages, DPDK, kernel bypass | Not implemented or validated. |
+| Fixed-membership distributed barrier and handoff to one strict owner | Implemented and loopback-tested, including prepare timeout/abort behaviour. |
+| Crash recovery for an interrupted handoff | Not yet durable: production needs persisted term/state plus authenticated membership. |
+| Distributed CRDT admission | Deliberately not implemented: CRDT merge alone is unsafe for a hard limit. |
+| RSS pinning, huge pages, DPDK, kernel bypass | Optional code is implemented; hardware deployment and measurement are not validated. |
 | NIC/kernel bottleneck proof | Not done; needs matched instrumentation and saturation tests. |

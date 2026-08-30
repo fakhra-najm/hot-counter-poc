@@ -1,7 +1,7 @@
 CXX ?= c++
 CXXFLAGS = -O3 -std=c++20 -Wall -Wextra -Werror -pthread -Iinclude
 BUILD = build
-CORE = src/strict_counter.cpp src/reserved_counter.cpp src/routing.cpp src/gcounter.cpp src/hotkey_detector.cpp src/engine.cpp src/transport.cpp
+CORE = src/strict_counter.cpp src/reserved_counter.cpp src/reservation_plan.cpp src/routing.cpp src/gcounter.cpp src/hotkey_detector.cpp src/engine.cpp src/replication.cpp src/distributed_handoff.cpp src/transport.cpp
 all: $(BUILD)/counterd $(BUILD)/correctness
 $(BUILD):
 	mkdir -p $@
@@ -11,6 +11,11 @@ $(BUILD)/correctness: $(CORE) tests/correctness.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 test: $(BUILD)/correctness
 	$(BUILD)/correctness
+dpdk: $(BUILD)
+	@pkg-config --exists libdpdk || (echo "libdpdk development files are required"; exit 2)
+	$(CXX) $(CXXFLAGS) -DCOUNTER_POC_WITH_DPDK $$(pkg-config --cflags libdpdk) $(CORE) dpdk/main.cpp -o $(BUILD)/counterd_dpdk $$(pkg-config --libs libdpdk)
+dpdk-client: $(BUILD)
+	$(CXX) $(CXXFLAGS) dpdk/udp_client.cpp -o $(BUILD)/counterd_udp_client
 clean:
 	rm -rf $(BUILD)
-.PHONY: all test clean
+.PHONY: all test dpdk dpdk-client clean
